@@ -1,0 +1,56 @@
+# Render Blueprint for the API (free plan, Docker). Render → New → Blueprint → pick this repository.
+# Values marked `sync: false` are asked for when the Blueprint is created (see docs/deployment-free.md).
+services:
+  - type: web
+    name: accountability-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./deploy/api.Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/live
+    autoDeploy: true
+    buildFilter:
+      paths: ["apps/api/**", "deploy/api.Dockerfile", "deploy/start.sh", "package-lock.json", "render.yaml"]
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RUN_MIGRATIONS
+        value: "true"
+      - key: JOBS_ENABLED
+        value: "true"
+      # Supabase → Connect → Session pooler URI, with ?schema=app&sslmode=require&connection_limit=5 appended
+      - key: DATABASE_URL
+        sync: false
+      # Your Cloudflare Pages address, e.g. https://accountability.pages.dev
+      - key: APP_URL
+        sync: false
+      # Printed by deploy/make-env.sh --cloud (must equal the Pages ORIGIN_SECRET)
+      - key: ORIGIN_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: STORAGE_SIGNING_SECRET
+        generateValue: true
+      - key: SESSION_TTL_DAYS
+        value: "7"
+      # Photos: Supabase Storage through its S3 endpoint (bytes are proxied by the API; the bucket stays private)
+      - key: STORAGE_DRIVER
+        value: s3
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: STORAGE_BUCKET
+        value: evidence
+      - key: STORAGE_ACCESS_KEY
+        sync: false
+      - key: STORAGE_SECRET_KEY
+        sync: false
+      # Web Push (printed by deploy/make-env.sh --cloud)
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false

@@ -1,0 +1,33 @@
+{
+  "name": "accountability",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Accountability MVP \u2014 Goal \u2192 Commitment \u2192 Daily plan \u2192 Check-in \u2192 Score \u2192 Review",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start:local": "bash scripts/dev.sh",
+    "predev": "node scripts/preflight.mjs",
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
+    "db:up": "docker compose up -d postgres",
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "db:seed": "npm run db:seed -w apps/api",
+    "create-admin": "npm run create-admin -w apps/api --",
+    "vapid-keys": "npm run vapid-keys -w apps/api",
+    "db:reset": "npm run db:reset -w apps/api",
+    "lint": "npm run lint -w apps/api && npm run lint -w apps/web",
+    "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/web",
+    "test": "npm run test -w apps/api && npm run test -w apps/web",
+    "test:integration": "npm run test:integration -w apps/api",
+    "test:e2e": "npm run test:e2e -w apps/web",
+    "build": "npm run build -w apps/api && npm run build -w apps/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

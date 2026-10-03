@@ -1,0 +1,19 @@
+# TLS for the API origin. API_HOST can be a free sslip.io name for the VM's IP (e.g. 141-147-1-2.sslip.io)
+# or a real hostname. Caddy obtains and renews the Let's Encrypt certificate automatically.
+{
+	email {$ACME_EMAIL}
+}
+
+{$API_HOST} {
+	encode gzip
+	# The API also rejects requests without the Pages proxy's secret; this keeps scanners off the logs.
+	@docs path /docs*
+	respond @docs 404
+	reverse_proxy api:4000 {
+		header_up X-Forwarded-Proto https
+	}
+	log {
+		output stdout
+		format json
+	}
+}

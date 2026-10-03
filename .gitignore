@@ -1,0 +1,19 @@
+node_modules
+.env
+.env.local
+dist
+.next
+coverage
+storage
+playwright-report
+test-results
+*.log
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.seeded
+.sandbox
+storage-test
+
+# Production secrets
+deploy/.env.production

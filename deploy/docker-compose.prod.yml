@@ -1,0 +1,81 @@
+# Production stack for one VM (Oracle Always Free ARM works well).
+#   cd deploy && docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+# Only Caddy publishes ports (80/443). Postgres and the API are reachable only inside this network.
+name: accountability
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: accountability
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: accountability
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accountability"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    shm_size: 256mb
+
+  api:
+    image: accountability-api:${RELEASE:-latest}
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.production
+    environment:
+      NODE_ENV: production
+      API_PORT: "4000"
+      DATABASE_URL: postgresql://accountability:${POSTGRES_PASSWORD}@postgres:5432/accountability?schema=public
+      STORAGE_LOCAL_DIR: /data/storage
+      JOBS_ENABLED: "true"
+    volumes:
+      - storage:/data/storage
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  backup:
+    build: ./backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.production
+    environment:
+      PGHOST: postgres
+      PGUSER: accountability
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: accountability
+    volumes:
+      - backups:/backups
+      - storage:/data/storage:ro
+
+volumes:
+  pgdata:
+  storage:
+  backups:
+  caddy_data:
+  caddy_config:

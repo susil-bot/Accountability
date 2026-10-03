@@ -1,0 +1,869 @@
+// Accountability MVP — data model
+// Conventions:
+//  * All instants (createdAt, scheduledAt, completedAt …) are stored in UTC (timestamptz).
+//  * "Accountability dates" (the user's local calendar day) are stored as DATE columns
+//    computed in the user's IANA timezone — never in server time.
+//  * History is never deleted: commitments are paused, goals abandoned, occurrences keep
+//    a snapshot of the commitment settings that applied when they were generated.
+
+generator client {
+  provider = "prisma-client-js"
+  // Rust-free client: queries are compiled in WASM and executed through @prisma/adapter-pg.
+  engineType = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  USER
+  MENTOR
+  ADMIN
+}
+
+enum AssignmentStatus {
+  PENDING
+  ACTIVE
+  ENDED
+}
+
+enum AssignmentEndReason {
+  DECLINED
+  REASSIGNED
+  UNASSIGNED
+  CLIENT_STOPPED
+  ACCOUNT_DEACTIVATED
+}
+
+enum GoalCategory {
+  CAREER
+  STUDY
+  FITNESS
+  HEALTH
+  FINANCE
+  BUSINESS
+  PERSONAL
+  CODING
+  OTHER
+}
+
+enum GoalStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ABANDONED
+}
+
+enum CommitmentFrequency {
+  DAILY
+  WEEKLY
+  CUSTOM
+}
+
+enum TargetUnit {
+  COUNT
+  MINUTES
+  HOURS
+  PERCENTAGE
+  BOOLEAN
+  DISTANCE
+  CURRENCY
+  CUSTOM
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum OccurrenceStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  PARTIAL
+  MISSED
+  SKIPPED
+}
+
+enum OccurrencePeriod {
+  DAY
+  WEEK
+}
+
+enum CheckInStatus {
+  PENDING
+  COMPLETED
+  MISSED
+  LATE
+}
+
+enum EvidenceType {
+  IMAGE
+  FILE
+  URL
+  TEXT
+}
+
+enum VerificationStatus {
+  SELF_REPORTED
+  COACH_VERIFIED
+}
+
+enum NotificationType {
+  TASK_REMINDER
+  CHECKIN_REMINDER
+  CHECKIN_MISSED
+  STREAK_MILESTONE
+  WEEKLY_REVIEW
+  GOAL_DEADLINE
+  ASSIGNMENT
+  MENTOR_NUDGE
+  SESSION_REMINDER
+  MENTOR_ALERT
+  MENTOR_SUMMARY
+  FOLLOW_UP_DUE
+  MENTOR_UPDATE
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum SubscriptionPlan {
+  FREE
+  PRO
+  COACH
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELLED
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(USER)
+  /// IANA timezone, e.g. "Asia/Kolkata". Mandatory.
+  timezone     String
+  avatarUrl    String?
+  isActive     Boolean  @default(true)
+  /// Local check-in time "HH:mm" in the user's timezone.
+  checkInTime  String   @default("21:00")
+  /// ISO weekdays (1 = Monday … 7 = Sunday) that are configured rest days.
+  restDays     Int[]    @default([])
+  onboardedAt  DateTime? @db.Timestamptz(3)
+  /// Bumped on logout-everywhere / password change to invalidate existing sessions.
+  tokenVersion Int      @default(0)
+  lastActiveAt DateTime? @db.Timestamptz(3)
+  /// Optional phone number (E.164). Only ever shown to a mentor inside a WhatsApp link, and only after opt-in.
+  phone        String?
+  /// Client opted in to "let my mentor contact me on WhatsApp".
+  mentorWhatsappOptIn Boolean @default(false)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  goals                  Goal[]
+  checkIns               CheckIn[]
+  evidence               Evidence[]               @relation("EvidenceOwner")
+  verifiedEvidence       Evidence[]               @relation("EvidenceVerifier")
+  streak                 Streak?
+  dailyAccountability    DailyAccountability[]
+  weeklyReviews          WeeklyReview[]
+  notifications          Notification[]
+  notificationPreference NotificationPreference?
+  coachNotesAbout        CoachNote[]              @relation("CoachNoteSubject")
+  coachNotesWritten      CoachNote[]              @relation("CoachNoteAuthor")
+  subscription           Subscription?
+  evidenceUploads        EvidenceUpload[]
+  auditLogs              AuditLog[]               @relation("AuditSubject")
+  auditActions           AuditLog[]               @relation("AuditActor")
+  mentorProfile          MentorProfile?
+  mentoring              MentorAssignment[]       @relation("AssignmentMentor")
+  mentoredBy             MentorAssignment[]       @relation("AssignmentClient")
+  reviewsGiven           MentorReview[]           @relation("ReviewMentor")
+  reviewsReceived        MentorReview[]           @relation("ReviewClient")
+  pushSubscriptions      PushSubscription[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+// ───────────────────────────── Goal engine ─────────────────────────────
+
+model Goal {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @db.Uuid
+  title          String
+  description    String?
+  /// "Why is this important?"
+  motivation     String?
+  /// "How will you measure success?"
+  successMeasure String?
+  category       GoalCategory @default(OTHER)
+  status         GoalStatus   @default(DRAFT)
+  isPrimary      Boolean      @default(false)
+  startDate      DateTime     @db.Date
+  targetDate     DateTime?    @db.Date
+  /// Optional numeric target (e.g. 150 applications). Null → manual completion only.
+  targetValue    Decimal?     @db.Decimal(12, 2)
+  targetUnit     TargetUnit?
+  /// Commitment whose actual values accumulate towards targetValue (e.g. "applications").
+  progressCommitmentId String? @db.Uuid
+  notes          String?
+  completedAt    DateTime?    @db.Timestamptz(3)
+  pausedAt       DateTime?    @db.Timestamptz(3)
+  createdAt      DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(3)
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  commitments Commitment[]
+
+  @@index([userId, status])
+  @@index([createdAt])
+}
+
+model Commitment {
+  id               String              @id @default(uuid()) @db.Uuid
+  goalId           String              @db.Uuid
+  title            String
+  description      String?
+  frequency        CommitmentFrequency @default(DAILY)
+  /// Structured recurrence rule, see src/domain/recurrence.ts
+  recurrence       Json
+  targetValue      Decimal             @default(1) @db.Decimal(12, 2)
+  targetUnit       TargetUnit          @default(BOOLEAN)
+  customUnitLabel  String?
+  startDate        DateTime            @db.Date
+  endDate          DateTime?           @db.Date
+  /// Local "HH:mm" preferred time in `timezone`.
+  preferredTime    String?
+  timezone         String
+  evidenceRequired Boolean             @default(false)
+  active           Boolean             @default(true)
+  pausedAt         DateTime?           @db.Timestamptz(3)
+  resumeAt         DateTime?           @db.Date
+  /// Archived instead of deleted when history exists.
+  archivedAt       DateTime?           @db.Timestamptz(3)
+  sortOrder        Int                 @default(0)
+  createdAt        DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime            @updatedAt @db.Timestamptz(3)
+
+  goal  Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  @@index([goalId, active])
+}
+
+model Task {
+  id               String       @id @default(uuid()) @db.Uuid
+  commitmentId     String       @db.Uuid
+  title            String
+  description      String?
+  estimatedMinutes Int?
+  priority         TaskPriority @default(MEDIUM)
+  requiresEvidence Boolean      @default(false)
+  /// Archived tasks stop generating occurrences but keep their history.
+  archivedAt       DateTime?    @db.Timestamptz(3)
+  createdAt        DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @db.Timestamptz(3)
+
+  commitment  Commitment       @relation(fields: [commitmentId], references: [id], onDelete: Cascade)
+  occurrences TaskOccurrence[]
+
+  @@index([commitmentId])
+}
+
+/// One concrete instance of a task on one accountability date.
+/// Settings (title/target/unit/evidence) are SNAPSHOTTED at generation so later
+/// commitment edits never rewrite history.
+model TaskOccurrence {
+  id                 String           @id @default(uuid()) @db.Uuid
+  taskId             String           @db.Uuid
+  /// Denormalised owner for fast, safe ownership filtering.
+  userId             String           @db.Uuid
+  /// Local date (user timezone). For WEEK-period occurrences this is the Monday of the week.
+  scheduledDate      DateTime         @db.Date
+  period             OccurrencePeriod @default(DAY)
+  scheduledStartTime DateTime         @db.Timestamptz(3)
+  scheduledEndTime   DateTime         @db.Timestamptz(3)
+  status             OccurrenceStatus @default(PENDING)
+  title              String
+  targetValue        Decimal          @db.Decimal(12, 2)
+  targetUnit         TargetUnit
+  requiresEvidence   Boolean          @default(false)
+  actualValue        Decimal?         @db.Decimal(12, 2)
+  completionPercentage Int            @default(0)
+  completedAt        DateTime?        @db.Timestamptz(3)
+  missedAt           DateTime?        @db.Timestamptz(3)
+  /// Minutes between scheduledStartTime and completedAt (analytical signal only).
+  completionDelayMinutes Int?
+  completedLate      Boolean          @default(false)
+  createdAt          DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime         @updatedAt @db.Timestamptz(3)
+
+  task        Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  completions TaskCompletion[]
+  evidence    Evidence[]
+
+  @@unique([taskId, scheduledDate])
+  @@index([userId, scheduledDate])
+  @@index([userId, status])
+  @@index([scheduledDate])
+}
+
+/// Append-only log of completion updates. The latest row (isCurrent = true)
+/// is the single active completion state for the occurrence.
+model TaskCompletion {
+  id                   String           @id @default(uuid()) @db.Uuid
+  taskOccurrenceId     String           @db.Uuid
+  status               OccurrenceStatus
+  actualValue          Decimal?         @db.Decimal(12, 2)
+  completionPercentage Int
+  note                 String?
+  source               String           @default("TASK")
+  isCurrent            Boolean          @default(true)
+  completedAt          DateTime         @default(now()) @db.Timestamptz(3)
+
+  occurrence TaskOccurrence @relation(fields: [taskOccurrenceId], references: [id], onDelete: Cascade)
+
+  @@index([taskOccurrenceId, isCurrent])
+}
+
+// ───────────────────────────── Accountability ─────────────────────────────
+
+model CheckIn {
+  id                   String        @id @default(uuid()) @db.Uuid
+  userId               String        @db.Uuid
+  date                 DateTime      @db.Date
+  scheduledAt          DateTime      @db.Timestamptz(3)
+  startedAt            DateTime?     @db.Timestamptz(3)
+  completedAt          DateTime?     @db.Timestamptz(3)
+  status               CheckInStatus @default(PENDING)
+  completionPercentage Int           @default(0)
+  /// Blocker reason codes, e.g. ["TOO_BUSY","OTHER"]
+  blockers             String[]      @default([])
+  blocker              String?
+  /// Confidence about tomorrow, 1–5
+  confidence           Int?
+  mood                 Int?
+  reflection           String?
+  /// Client chose "keep this private": the reflection is never shown to their mentor.
+  reflectionPrivate    Boolean       @default(false)
+  createdAt            DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime      @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([date, status])
+}
+
+model Evidence {
+  id               String             @id @default(uuid()) @db.Uuid
+  userId           String             @db.Uuid
+  taskOccurrenceId String             @db.Uuid
+  type             EvidenceType
+  /// External URL (type URL only). Never an internal storage path.
+  url              String?
+  /// Random opaque storage key (IMAGE/FILE).
+  storageKey       String?
+  /// Optional thumbnail object (images), generated on the client.
+  thumbnailKey     String?            @unique
+  mimeType         String?
+  sizeBytes        Int?
+  originalName     String?
+  description      String?
+  verification     VerificationStatus @default(SELF_REPORTED)
+  submittedAt      DateTime           @default(now()) @db.Timestamptz(3)
+  verifiedAt       DateTime?          @db.Timestamptz(3)
+  verifiedBy       String?            @db.Uuid
+  deletedAt        DateTime?          @db.Timestamptz(3)
+
+  user       User           @relation("EvidenceOwner", fields: [userId], references: [id], onDelete: Cascade)
+  verifier   User?          @relation("EvidenceVerifier", fields: [verifiedBy], references: [id])
+  occurrence TaskOccurrence @relation(fields: [taskOccurrenceId], references: [id], onDelete: Cascade)
+
+  @@unique([storageKey])
+  @@index([taskOccurrenceId])
+  @@index([userId, submittedAt])
+}
+
+/// Materialised per-day result. Source of truth for streaks, calendar and weekly analytics.
+model DailyAccountability {
+  id                   String   @id @default(uuid()) @db.Uuid
+  userId               String   @db.Uuid
+  date                 DateTime @db.Date
+  plannedCount         Int      @default(0)
+  completedCount       Int      @default(0)
+  partialCount         Int      @default(0)
+  missedCount          Int      @default(0)
+  completionPercentage Int      @default(0)
+  checkInCompleted     Boolean  @default(false)
+  evidencePercentage   Int?
+  commitmentPercentage Int      @default(0)
+  dailyScore           Int      @default(0)
+  isRestDay            Boolean  @default(false)
+  isSuccessful         Boolean  @default(false)
+  /// Day is closed (past local midnight). Open days can still change.
+  isFinal              Boolean  @default(false)
+  /// Streak length as of this day (0 when the day broke it).
+  streakDay            Int      @default(0)
+  createdAt            DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([date])
+}
+
+model Streak {
+  id                 String    @id @default(uuid()) @db.Uuid
+  userId             String    @unique @db.Uuid
+  currentStreak      Int       @default(0)
+  longestStreak      Int       @default(0)
+  lastSuccessfulDate DateTime? @db.Date
+  /// Length of the streak that most recently ended (for "Previous streak: 14 days").
+  previousStreak     Int       @default(0)
+  updatedAt          DateTime  @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model WeeklyReview {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @db.Uuid
+  weekStart      DateTime  @db.Date
+  weekEnd        DateTime  @db.Date
+  metrics        Json
+  /// Validated AI (or deterministic fallback) output: summary/strengths/challenges/suggestions
+  content        Json
+  source         String    @default("DETERMINISTIC")
+  acknowledgedAt DateTime? @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, weekStart])
+}
+
+// ───────────────────────────── Notifications ─────────────────────────────
+
+model Notification {
+  id          String             @id @default(uuid()) @db.Uuid
+  userId      String             @db.Uuid
+  type        NotificationType
+  title       String
+  body        String
+  /// Idempotency key, e.g. "CHECKIN_MISSED:2026-10-01"
+  dedupeKey   String
+  scheduledAt DateTime           @db.Timestamptz(3)
+  sentAt      DateTime?          @db.Timestamptz(3)
+  readAt      DateTime?          @db.Timestamptz(3)
+  status      NotificationStatus @default(PENDING)
+  /// In-app path the notification opens, e.g. "/mentor/clients/detail?id=…".
+  link        String?
+  /// The person the notification is about (mentor alerts), used for response-time tracking.
+  subjectId   String?            @db.Uuid
+  createdAt   DateTime           @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt])
+  @@index([userId, type, createdAt])
+  @@index([status, scheduledAt])
+}
+
+model NotificationPreference {
+  userId                 String  @id @db.Uuid
+  emailEnabled           Boolean @default(true)
+  pushEnabled            Boolean @default(false)
+  whatsappEnabled        Boolean @default(false)
+  taskReminderEnabled    Boolean @default(true)
+  checkinReminderEnabled Boolean @default(true)
+  weeklyReviewEnabled    Boolean @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────────── Coaching / billing / audit ─────────────────────────────
+
+model CoachNote {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  authorId  String   @db.Uuid
+  body      String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user   User @relation("CoachNoteSubject", fields: [userId], references: [id], onDelete: Cascade)
+  author User @relation("CoachNoteAuthor", fields: [authorId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+model Subscription {
+  id                     String             @id @default(uuid()) @db.Uuid
+  userId                 String             @unique @db.Uuid
+  provider               String             @default("NONE")
+  providerSubscriptionId String?
+  plan                   SubscriptionPlan   @default(FREE)
+  status                 SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart     DateTime?          @db.Timestamptz(3)
+  currentPeriodEnd       DateTime?          @db.Timestamptz(3)
+  createdAt              DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime           @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @db.Uuid
+  actorId    String?  @db.Uuid
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  user  User? @relation("AuditSubject", fields: [userId], references: [id], onDelete: SetNull)
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+}
+
+// ───────────────────────────── Uploads & background jobs ─────────────────────────────
+
+/// A short-lived upload ticket. The browser PUTs bytes straight to storage with the signed URL,
+/// then confirms; unconfirmed tickets (and their objects) are cleaned up by a background job.
+model EvidenceUpload {
+  key                  String    @id
+  thumbnailKey         String?   @unique
+  userId               String    @db.Uuid
+  taskOccurrenceId     String    @db.Uuid
+  contentType          String
+  thumbnailContentType String?
+  maxBytes             Int
+  expiresAt            DateTime  @db.Timestamptz(3)
+  confirmedAt          DateTime? @db.Timestamptz(3)
+  createdAt            DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([confirmedAt, expiresAt])
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  DONE
+  DEAD
+}
+
+/// Postgres-backed job queue (replaces Redis/BullMQ). Workers claim rows with FOR UPDATE SKIP LOCKED.
+model Job {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  payload     Json      @default("{}")
+  status      JobStatus @default(QUEUED)
+  runAt       DateTime  @default(now()) @db.Timestamptz(3)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  /// Idempotency key: enqueueing the same key twice is a no-op.
+  dedupeKey   String?   @unique
+  lockedAt    DateTime? @db.Timestamptz(3)
+  lockedBy    String?
+  lastError   String?
+  finishedAt  DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([status, runAt])
+  @@index([name, status])
+}
+
+/// Liveness markers for the scheduler (read by /health and the Cloudflare watchdog).
+model SystemHeartbeat {
+  name   String   @id
+  at     DateTime @db.Timestamptz(3)
+  detail Json?
+}
+
+// ───────────────────────────── Mentoring ─────────────────────────────
+
+model MentorProfile {
+  userId    String   @id @db.Uuid
+  /// Maximum open (pending + active) clients. Assigning beyond it needs an explicit admin override.
+  capacity  Int      @default(15)
+  bio       String?
+  /// One line shown in the client's mentor directory, e.g. "Career coach · ex-hiring manager".
+  headline  String?
+  /// Goal categories this mentor is a good fit for (drives "Good match" in the directory).
+  focusAreas GoalCategory[] @default([])
+  languages String[] @default([])
+  /// Whether clients can choose this mentor themselves (admins can still assign).
+  acceptingClients Boolean @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// One-time mentor invite. Only a SHA-256 hash of the token is stored.
+model MentorInvite {
+  id          String    @id @default(uuid()) @db.Uuid
+  email       String
+  name        String
+  tokenHash   String    @unique
+  expiresAt   DateTime  @db.Timestamptz(3)
+  usedAt      DateTime? @db.Timestamptz(3)
+  revokedAt   DateTime? @db.Timestamptz(3)
+  invitedById String    @db.Uuid
+  userId      String?   @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([email])
+}
+
+/// The link between a mentor and a client. A client has at most one PENDING/ACTIVE row
+/// (enforced by the partial unique index "MentorAssignment_one_open_per_client").
+model MentorAssignment {
+  id           String               @id @default(uuid()) @db.Uuid
+  mentorId     String               @db.Uuid
+  clientId     String               @db.Uuid
+  status       AssignmentStatus     @default(PENDING)
+  assignedById String               @db.Uuid
+  note         String?
+  acceptedAt   DateTime?            @db.Timestamptz(3)
+  endedAt      DateTime?            @db.Timestamptz(3)
+  endedById    String?              @db.Uuid
+  endReason    AssignmentEndReason?
+  createdAt    DateTime             @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime             @updatedAt @db.Timestamptz(3)
+
+  mentor User @relation("AssignmentMentor", fields: [mentorId], references: [id], onDelete: Cascade)
+  client User @relation("AssignmentClient", fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([mentorId, status])
+  @@index([clientId, createdAt])
+}
+
+/// "Reviewed today" tick: one per mentor, client and mentor-local date.
+model MentorReview {
+  id        String   @id @default(uuid()) @db.Uuid
+  mentorId  String   @db.Uuid
+  clientId  String   @db.Uuid
+  date      DateTime @db.Date
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  mentor User @relation("ReviewMentor", fields: [mentorId], references: [id], onDelete: Cascade)
+  client User @relation("ReviewClient", fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([mentorId, clientId, date])
+  @@index([clientId, createdAt])
+}
+
+// ───────────────────────────── Mentor toolkit ─────────────────────────────
+
+enum SessionChannel {
+  WHATSAPP
+  PHONE
+  VIDEO
+  IN_PERSON
+}
+
+enum SessionStatus {
+  SCHEDULED
+  DONE
+  NO_SHOW
+  CANCELLED
+}
+
+enum NoteKind {
+  SESSION
+  QUICK
+}
+
+enum ActionOwner {
+  CLIENT
+  MENTOR
+}
+
+enum ActionStatus {
+  OPEN
+  DONE
+  DROPPED
+}
+
+enum NudgeCondition {
+  NO_CHECKIN_BY
+  MISSED_TASK_DAYS
+  INACTIVE_DAYS
+}
+
+/// A call or meeting between a mentor and a client. Reminders are jobs keyed by (session, start time),
+/// so moving a session creates fresh reminders and the old ones become no-ops.
+model MentorSession {
+  id              String         @id @default(uuid()) @db.Uuid
+  mentorId        String         @db.Uuid
+  clientId        String         @db.Uuid
+  assignmentId    String         @db.Uuid
+  startsAt        DateTime       @db.Timestamptz(3)
+  durationMin     Int            @default(30)
+  channel         SessionChannel @default(WHATSAPP)
+  link            String?
+  status          SessionStatus  @default(SCHEDULED)
+  /// Agenda items [{ id, text, done }] built from the prep sheet.
+  agenda          Json           @default("[]")
+  /// Sessions created together as a weekly series share a seriesId.
+  seriesId        String?        @db.Uuid
+  reminderLeadMin Int            @default(5)
+  createdAt       DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@index([mentorId, startsAt])
+  @@index([clientId, startsAt])
+  @@index([assignmentId])
+}
+
+/// Private mentor note about a client. Edits bump `version` and keep the previous copy in MentorNoteVersion.
+model MentorNote {
+  id            String    @id @default(uuid()) @db.Uuid
+  clientId      String    @db.Uuid
+  authorId      String    @db.Uuid
+  sessionId     String?   @unique @db.Uuid
+  kind          NoteKind  @default(QUICK)
+  /// Session template: { howTheyAreDoing, wins, challenges, agreed, nextSession }
+  sections      Json      @default("{}")
+  /// Plain text of the note (quick notes, and the searchable text of session notes).
+  text          String    @default("")
+  tags          String[]  @default([])
+  pinned        Boolean   @default(false)
+  isDraft       Boolean   @default(false)
+  /// Optional short summary the client can see ("From your mentor").
+  sharedSummary String?
+  sharedAt      DateTime? @db.Timestamptz(3)
+  archivedAt    DateTime? @db.Timestamptz(3)
+  version       Int       @default(1)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  versions MentorNoteVersion[]
+
+  @@index([clientId, createdAt])
+  @@index([authorId, createdAt])
+}
+
+/// Append-only copy of a note as it was before an edit.
+model MentorNoteVersion {
+  id            String   @id @default(uuid()) @db.Uuid
+  noteId        String   @db.Uuid
+  version       Int
+  sections      Json
+  text          String
+  tags          String[] @default([])
+  sharedSummary String?
+  editedById    String   @db.Uuid
+  editedAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  note MentorNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@unique([noteId, version])
+}
+
+model ActionItem {
+  id        String       @id @default(uuid()) @db.Uuid
+  clientId  String       @db.Uuid
+  mentorId  String       @db.Uuid
+  owner     ActionOwner
+  title     String
+  dueDate   DateTime?    @db.Date
+  status    ActionStatus @default(OPEN)
+  noteId    String?      @db.Uuid
+  doneAt    DateTime?    @db.Timestamptz(3)
+  createdAt DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime     @updatedAt @db.Timestamptz(3)
+
+  @@index([clientId, status])
+  @@index([mentorId, status, dueDate])
+}
+
+model Nudge {
+  id          String    @id @default(uuid()) @db.Uuid
+  mentorId    String?   @db.Uuid
+  clientId    String    @db.Uuid
+  ruleId      String?   @db.Uuid
+  template    String
+  body        String
+  sentAt      DateTime  @default(now()) @db.Timestamptz(3)
+  /// First check-in or task completion by the client after the nudge.
+  respondedAt DateTime? @db.Timestamptz(3)
+
+  @@index([clientId, sentAt])
+  @@index([mentorId, sentAt])
+}
+
+model NudgeRule {
+  id          String         @id @default(uuid()) @db.Uuid
+  mentorId    String         @db.Uuid
+  clientId    String         @db.Uuid
+  condition   NudgeCondition
+  /// { time: "21:30" } or { days: 2 }
+  params      Json           @default("{}")
+  message     String
+  active      Boolean        @default(true)
+  lastFiredOn DateTime?      @db.Date
+  createdAt   DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@index([clientId, active])
+}
+
+/// A browser Web Push endpoint for one user (one row per device/browser).
+model PushSubscription {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  lastUsedAt DateTime? @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model WeeklyReport {
+  id            String    @id @default(uuid()) @db.Uuid
+  clientId      String    @db.Uuid
+  mentorId      String?   @db.Uuid
+  weekStart     DateTime  @db.Date
+  metrics       Json
+  mentorComment String?
+  sharedAt      DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@unique([clientId, weekStart])
+}
