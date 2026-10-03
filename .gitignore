@@ -17,3 +17,6 @@ storage-test
 
 # Production secrets
 deploy/.env.production
+
+apps/web/.wrangler/
+dump.rdb
